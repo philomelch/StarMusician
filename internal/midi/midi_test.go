@@ -313,6 +313,104 @@ func TestTransposeDropsNotesOutsideValidMIDIRange(t *testing.T) {
 	}
 }
 
+func TestLoadMergesOverlappingSamePitchOnsets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.mid")
+
+	s := smf.NewSMF1()
+	var meta smf.Track
+	meta.Add(0, smf.MetaTempo(120))
+	meta.Close(0)
+	if err := s.Add(meta); err != nil {
+		t.Fatalf("adding meta track: %v", err)
+	}
+
+	// Note 60 struck again (a pedal/legato-overlap artifact) before its first
+	// onset's own note-off arrives, then released twice. This should collapse
+	// to a single sustained NoteOn (at the first onset) through NoteOff (at
+	// the last release) rather than reaching the engine as two distinct
+	// onsets needing their own retrigger.
+	var track smf.Track
+	track.Add(0, midi.NoteOn(0, 60, 100))
+	track.Add(120, midi.NoteOn(0, 60, 90)) // re-struck while still sounding
+	track.Add(120, midi.NoteOff(0, 60))    // closes the first onset
+	track.Add(240, midi.NoteOff(0, 60))    // closes the second onset
+	track.Close(0)
+	if err := s.Add(track); err != nil {
+		t.Fatalf("adding track: %v", err)
+	}
+
+	if err := s.WriteFile(path); err != nil {
+		t.Fatalf("writing test midi file: %v", err)
+	}
+
+	song, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(song.Events) != 2 {
+		t.Fatalf("got %d events, want 2 (one merged NoteOn/NoteOff pair): %+v", len(song.Events), song.Events)
+	}
+	if song.Events[0].Type != NoteOn || song.Events[0].Velocity != 100 || song.Events[0].Time != 0 {
+		t.Errorf("event 0 = %+v, want the first onset's NoteOn (vel 100, t=0)", song.Events[0])
+	}
+	if song.Events[1].Type != NoteOff || song.Events[1].Time <= song.Events[0].Time {
+		t.Errorf("event 1 = %+v, want the last release's NoteOff, after the onset", song.Events[1])
+	}
+
+	if len(song.Parts) != 1 || song.Parts[0].NoteCount != 1 {
+		t.Errorf("parts = %+v, want a single part with NoteCount 1 (the merged onset counts once)", song.Parts)
+	}
+}
+
+func TestMergeOverlappingNotesHandlesStrayNoteOffAndUnrelatedEvents(t *testing.T) {
+	events := []Event{
+		{Type: NoteOff, Track: 0, Channel: 0, Note: 60, Time: 0}, // stray: no open onset, must pass through
+		{Type: Sustain, On: true, Time: 0.1},
+		{Type: NoteOn, Track: 0, Channel: 0, Note: 64, Time: 0.2},
+		{Type: NoteOn, Track: 0, Channel: 0, Note: 64, Time: 0.3},  // overlap: same pitch, dropped
+		{Type: NoteOn, Track: 0, Channel: 0, Note: 64, Time: 0.35}, // overlap: same pitch, dropped
+		{Type: NoteOff, Track: 0, Channel: 0, Note: 64, Time: 0.4}, // closes the 2nd overlap: dropped
+		{Type: NoteOff, Track: 0, Channel: 0, Note: 64, Time: 0.5}, // closes the 3rd overlap: dropped
+		{Type: NoteOff, Track: 0, Channel: 0, Note: 64, Time: 0.6}, // closes the 1st (original) onset: kept
+	}
+
+	got := mergeOverlappingNotes(events)
+
+	want := []Event{
+		{Type: NoteOff, Track: 0, Channel: 0, Note: 60, Time: 0},
+		{Type: Sustain, On: true, Time: 0.1},
+		{Type: NoteOn, Track: 0, Channel: 0, Note: 64, Time: 0.2},
+		{Type: NoteOff, Track: 0, Channel: 0, Note: 64, Time: 0.6},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d events, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("event %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestMergeOverlappingNotesKeepsDistinctPitchesAndChannelsSeparate(t *testing.T) {
+	events := []Event{
+		{Type: NoteOn, Track: 0, Channel: 0, Note: 60, Time: 0},
+		{Type: NoteOn, Track: 0, Channel: 1, Note: 60, Time: 0.1}, // same pitch, different channel: independent
+		{Type: NoteOn, Track: 1, Channel: 0, Note: 60, Time: 0.2}, // same pitch, different track: independent
+		{Type: NoteOff, Track: 0, Channel: 0, Note: 60, Time: 0.3},
+		{Type: NoteOff, Track: 0, Channel: 1, Note: 60, Time: 0.4},
+		{Type: NoteOff, Track: 1, Channel: 0, Note: 60, Time: 0.5},
+	}
+
+	got := mergeOverlappingNotes(events)
+
+	if len(got) != len(events) {
+		t.Fatalf("got %d events, want %d (nothing should be merged across different tracks/channels): %+v", len(got), len(events), got)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "does-not-exist.mid")); err == nil {
 		t.Fatal("Load with missing file: want error, got nil")
