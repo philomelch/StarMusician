@@ -121,6 +121,9 @@ func Transpose(events []Event, semitones int) []Event {
 // Load reads a .mid file and returns its note-on, note-off, and sustain
 // events flattened across all tracks and sorted by absolute time, along with
 // the instrument parts found within it.
+// Overlapping onsets of the same pitch
+// (see mergeOverlappingNotes) are collapsed before Parts' note counts are
+// tallied, so NoteCount reflects what will actually be dispatched.
 func Load(path string) (*Song, error) {
 	reader := smf.ReadTracks(path)
 	if err := reader.Error(); err != nil {
@@ -130,7 +133,6 @@ func Load(path string) (*Song, error) {
 	var events []Event
 	trackNames := make(map[int]string)
 	programs := make(map[partKey]uint8)
-	noteCounts := make(map[partKey]int)
 
 	reader.Do(func(te smf.TrackEvent) {
 		msg := te.Message
@@ -151,7 +153,6 @@ func Load(path string) (*Song, error) {
 		var note, velocity uint8
 		if msg.GetNoteStart(&channel, &note, &velocity) {
 			events = append(events, Event{Time: t, Type: NoteOn, Track: te.TrackNo, Channel: channel, Note: note, Velocity: velocity})
-			noteCounts[partKey{track: te.TrackNo, channel: channel}]++
 			return
 		}
 		if msg.GetNoteEnd(&channel, &note) {
@@ -170,6 +171,14 @@ func Load(path string) (*Song, error) {
 	}
 
 	sort.SliceStable(events, func(i, j int) bool { return events[i].Time < events[j].Time })
+	events = mergeOverlappingNotes(events)
+
+	noteCounts := make(map[partKey]int)
+	for _, ev := range events {
+		if ev.Type == NoteOn {
+			noteCounts[partKey{track: ev.Track, channel: ev.Channel}]++
+		}
+	}
 
 	parts := make([]Part, 0, len(noteCounts))
 	for pk, count := range noteCounts {
@@ -228,4 +237,47 @@ func humanizeCamelCase(s string) string {
 
 func microToSec(micro int64) float64 {
 	return float64(micro) / 1_000_000
+}
+
+// noteKey identifies one sounding pitch instance for mergeOverlappingNotes:
+// the same (Track, Channel, Note) triple the engine later uses to track held
+// notes.
+type noteKey struct {
+	track   int
+	channel uint8
+	note    uint8
+}
+
+// mergeOverlappingNotes collapses overlapping onsets of the same pitch — a
+// NoteOn for a (track, channel, note) that arrives while an earlier onset of
+// that exact same pitch is still sounding — into a single sustained
+// NoteOn/NoteOff pair spanning the earliest onset to the last release,
+// dropping the redundant NoteOn/NoteOff pairs in between.
+func mergeOverlappingNotes(events []Event) []Event {
+	depth := make(map[noteKey]int)
+	out := make([]Event, 0, len(events))
+	for _, ev := range events {
+		if ev.Type != NoteOn && ev.Type != NoteOff {
+			out = append(out, ev)
+			continue
+		}
+		nk := noteKey{track: ev.Track, channel: ev.Channel, note: ev.Note}
+		switch ev.Type {
+		case NoteOn:
+			if depth[nk] == 0 {
+				out = append(out, ev)
+			}
+			depth[nk]++
+		case NoteOff:
+			if depth[nk] == 0 {
+				out = append(out, ev) // stray: no open onset to close
+				continue
+			}
+			depth[nk]--
+			if depth[nk] == 0 {
+				out = append(out, ev)
+			}
+		}
+	}
+	return out
 }
